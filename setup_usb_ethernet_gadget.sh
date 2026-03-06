@@ -4,6 +4,8 @@ set -euo pipefail
 DEFAULT_IP="192.168.7.2"
 DEFAULT_NETMASK="255.255.255.0"
 DEFAULT_IFACE="usb0"
+DEFAULT_MODE="static"
+DEFAULT_BACKEND="auto"
 BACKUP_DIR_NAME="usb_gadget_backup"
 
 usage() {
@@ -12,14 +14,28 @@ Usage:
   sudo ./setup_usb_ethernet_gadget.sh [options]
 
 Options:
-  --ip <ipv4>          Static IPv4 exposed by Raspberry Pi over USB (default: 192.168.7.2)
-  --netmask <mask>     Netmask for the USB IPv4 (default: 255.255.255.0)
-  --iface <name>       Gadget network interface name (default: usb0)
-  --revert             Revert changes using files from ./usb_gadget_backup
-  -h, --help           Show this help
+  --ip <ipv4>              Static IPv4 exposed by Raspberry Pi over USB
+                           Default: 192.168.7.2
+  --netmask <mask>         Netmask for static USB IPv4
+                           Default: 255.255.255.0
+  --iface <name>           Gadget network interface name
+                           Default: usb0
+  --mode <static|dhcp>     Addressing mode for the USB link
+                           Default: static
+  --backend <auto|manual|official>
+                           `auto` prefers `rpi-usb-gadget` on Raspberry Pi OS
+                           Trixie when `--mode dhcp` is used and falls back to
+                           the manual `g_ether` setup otherwise
+                           Default: auto
+  --diagnose               Print readiness diagnostics without changing the system
+  --revert                 Revert changes using files from ./usb_gadget_backup
+  -h, --help               Show this help
 
 Examples:
   sudo ./setup_usb_ethernet_gadget.sh --ip 10.55.0.1 --netmask 255.255.255.0
+  sudo ./setup_usb_ethernet_gadget.sh --diagnose
+  sudo ./setup_usb_ethernet_gadget.sh --mode dhcp
+  sudo ./setup_usb_ethernet_gadget.sh --mode dhcp --backend official
   sudo ./setup_usb_ethernet_gadget.sh --revert
 USAGE
 }
@@ -29,10 +45,36 @@ fail() {
   exit 1
 }
 
+warn() {
+  echo "Warning: $*" >&2
+}
+
+note() {
+  echo "Info: $*"
+}
+
+have_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     fail "Run as root (use sudo)."
   fi
+}
+
+require_commands() {
+  local cmd
+  for cmd in awk chmod cp grep ip mkdir modprobe rm systemctl touch tr; do
+    have_command "$cmd" || fail "Required command not found: $cmd"
+  done
+}
+
+require_diagnose_commands() {
+  local cmd
+  for cmd in awk grep tr; do
+    have_command "$cmd" || fail "Required command not found for diagnostics: $cmd"
+  done
 }
 
 is_valid_ipv4() {
@@ -110,6 +152,56 @@ detect_boot_config() {
   fail "Could not find Raspberry Pi boot config file (expected /boot/firmware/config.txt or /boot/config.txt)."
 }
 
+boot_overlay_enabled() {
+  local boot_config
+  boot_config="$(detect_boot_config)"
+  grep -Eq '^[[:space:]]*dtoverlay=dwc2,dr_mode=peripheral([[:space:]]*#.*)?$' "$boot_config"
+}
+
+module_load_config_present() {
+  local module_name="$1"
+  local file
+  for file in /etc/modules /etc/modules-load.d/*.conf; do
+    [[ -e "$file" ]] || continue
+    if grep -Eq "^[[:space:]]*${module_name}([[:space:]]*#.*)?$" "$file"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+read_pi_model() {
+  if [[ -r /proc/device-tree/model ]]; then
+    tr -d '\0' < /proc/device-tree/model
+    return
+  fi
+  echo "unknown"
+}
+
+is_rpi_os_trixie() {
+  [[ -r /etc/os-release ]] || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${VERSION_CODENAME:-}" == "trixie" ]] || return 1
+  [[ "${ID:-}" == "raspbian" || "${ID:-}" == "debian" ]]
+}
+
+select_dhcp_client() {
+  if have_command dhclient; then
+    echo "dhclient"
+    return 0
+  fi
+  if have_command dhcpcd; then
+    echo "dhcpcd"
+    return 0
+  fi
+  if have_command udhcpc; then
+    echo "udhcpc"
+    return 0
+  fi
+  return 1
+}
+
 backup_path_for() {
   local target="$1"
   echo "${BACKUP_DIR}/${target#/}"
@@ -118,7 +210,7 @@ backup_path_for() {
 manifest_has_entry() {
   local target="$1"
   [[ -f "$MANIFEST_FILE" ]] || return 1
-  grep -Eq "^[MN] ${target}$" "$MANIFEST_FILE"
+  grep -Fxq "M ${target}" "$MANIFEST_FILE" || grep -Fxq "N ${target}" "$MANIFEST_FILE"
 }
 
 backup_file_if_needed() {
@@ -179,6 +271,8 @@ parse_args() {
   USB_IP="$DEFAULT_IP"
   USB_NETMASK="$DEFAULT_NETMASK"
   USB_IFACE="$DEFAULT_IFACE"
+  USB_MODE="$DEFAULT_MODE"
+  BACKEND_REQUESTED="$DEFAULT_BACKEND"
   ACTION="setup"
 
   while [[ $# -gt 0 ]]; do
@@ -198,6 +292,20 @@ parse_args() {
         USB_IFACE="$2"
         shift 2
         ;;
+      --mode)
+        [[ $# -ge 2 ]] || fail "Missing value for --mode"
+        USB_MODE="$2"
+        shift 2
+        ;;
+      --backend)
+        [[ $# -ge 2 ]] || fail "Missing value for --backend"
+        BACKEND_REQUESTED="$2"
+        shift 2
+        ;;
+      --diagnose)
+        ACTION="diagnose"
+        shift
+        ;;
       --revert)
         ACTION="revert"
         shift
@@ -212,17 +320,237 @@ parse_args() {
     esac
   done
 
-  if [[ "$ACTION" == "setup" ]]; then
+  if [[ "$ACTION" != "setup" ]]; then
+    return
+  fi
+
+  case "$USB_MODE" in
+    static|dhcp) ;;
+    *) fail "Invalid mode: ${USB_MODE}. Use static or dhcp." ;;
+  esac
+
+  case "$BACKEND_REQUESTED" in
+    auto|manual|official) ;;
+    *) fail "Invalid backend: ${BACKEND_REQUESTED}. Use auto, manual, or official." ;;
+  esac
+
+  if [[ "$USB_MODE" == "static" ]]; then
     is_valid_ipv4 "$USB_IP" || fail "Invalid IPv4 address: $USB_IP"
     is_valid_ipv4 "$USB_NETMASK" || fail "Invalid netmask: $USB_NETMASK"
     USB_CIDR="$(netmask_to_cidr "$USB_NETMASK")" || fail "Netmask is not contiguous: $USB_NETMASK"
   fi
 }
 
+resolve_backend() {
+  BACKEND_REASON=""
+  case "$BACKEND_REQUESTED" in
+    manual)
+      USB_BACKEND="manual"
+      BACKEND_REASON="requested explicitly"
+      ;;
+    official)
+      [[ "$USB_MODE" == "dhcp" ]] || fail "The official backend currently supports only --mode dhcp."
+      [[ "$USB_IFACE" == "usb0" ]] || fail "The official backend expects --iface usb0."
+      is_rpi_os_trixie || fail "The official backend requires Raspberry Pi OS Trixie."
+      have_command rpi-usb-gadget || fail "The official backend requires the rpi-usb-gadget command to be installed."
+      have_command nmcli || fail "The official backend requires NetworkManager's nmcli command."
+      USB_BACKEND="official"
+      BACKEND_REASON="requested explicitly"
+      ;;
+    auto)
+      if [[ "$USB_MODE" == "dhcp" ]] && [[ "$USB_IFACE" == "usb0" ]] && is_rpi_os_trixie && have_command rpi-usb-gadget && have_command nmcli; then
+        USB_BACKEND="official"
+        BACKEND_REASON="Raspberry Pi OS Trixie with rpi-usb-gadget available"
+      else
+        USB_BACKEND="manual"
+        if [[ "$USB_MODE" != "dhcp" ]]; then
+          BACKEND_REASON="static mode requires manual backend"
+        elif [[ "$USB_IFACE" != "usb0" ]]; then
+          BACKEND_REASON="official backend expects usb0"
+        elif ! is_rpi_os_trixie; then
+          BACKEND_REASON="official backend not available on this OS"
+        elif ! have_command rpi-usb-gadget; then
+          BACKEND_REASON="rpi-usb-gadget not installed"
+        elif ! have_command nmcli; then
+          BACKEND_REASON="official backend requires NetworkManager"
+        else
+          BACKEND_REASON="manual backend selected"
+        fi
+      fi
+      ;;
+  esac
+}
+
+print_preflight_diagnostics() {
+  local model
+  model="$(read_pi_model)"
+
+  note "Detected model: ${model}"
+  note "Selected backend: ${USB_BACKEND} (${BACKEND_REASON})"
+  note "Selected mode: ${USB_MODE}"
+
+  if [[ "$model" != "unknown" ]] && [[ "$model" != *"Raspberry Pi"* ]]; then
+    warn "This does not look like a Raspberry Pi. USB gadget bring-up is unlikely to work here."
+  fi
+
+  if [[ "$model" == *"Raspberry Pi 5"* ]]; then
+    warn "Raspberry Pi 5 gadget mode requires the OTG-capable USB-C port. If the board is unstable when powered through USB-C, power it separately and keep USB-C for data."
+  fi
+
+  if [[ "$USB_BACKEND" == "manual" ]] && [[ "$USB_MODE" == "dhcp" ]]; then
+    DHCP_CLIENT="$(select_dhcp_client)" || fail "DHCP mode requires dhclient, dhcpcd, or udhcpc for the manual backend."
+    note "Manual DHCP client: ${DHCP_CLIENT}"
+  fi
+
+  if have_command vcgencmd; then
+    local throttled
+    throttled="$(vcgencmd get_throttled 2>/dev/null | awk -F= '{print $2}' || true)"
+    if [[ -n "$throttled" ]] && [[ "$throttled" != "0x0" ]]; then
+      warn "Power/thermal status is not clean (get_throttled=${throttled}). USB gadget reliability may be affected."
+    fi
+  fi
+}
+
+diagnose_system() {
+  local model
+  local boot_config
+  local status
+
+  model="$(read_pi_model)"
+  echo "USB Ethernet gadget diagnostics"
+  echo "  Model:             ${model}"
+
+  if is_rpi_os_trixie; then
+    echo "  OS support:        Raspberry Pi OS Trixie detected"
+  else
+    echo "  OS support:        Raspberry Pi OS Trixie not detected"
+  fi
+
+  if boot_config="$(detect_boot_config 2>/dev/null)"; then
+    echo "  Boot config:       ${boot_config}"
+    if boot_overlay_enabled; then
+      echo "  OTG overlay:       enabled"
+    else
+      echo "  OTG overlay:       missing dtoverlay=dwc2,dr_mode=peripheral"
+    fi
+  else
+    echo "  Boot config:       not found"
+  fi
+
+  if module_load_config_present "dwc2"; then
+    echo "  Boot module dwc2:  configured"
+  else
+    echo "  Boot module dwc2:  not configured"
+  fi
+
+  if have_command modinfo && modinfo g_ether >/dev/null 2>&1; then
+    echo "  Kernel module:     g_ether available"
+  else
+    echo "  Kernel module:     g_ether not found by modinfo"
+  fi
+
+  if have_command rpi-usb-gadget; then
+    echo "  Official backend:  rpi-usb-gadget installed"
+  else
+    echo "  Official backend:  rpi-usb-gadget not installed"
+  fi
+
+  if have_command nmcli; then
+    echo "  NetworkManager:    nmcli available"
+  else
+    echo "  NetworkManager:    nmcli missing"
+  fi
+
+  if DHCP_CLIENT="$(select_dhcp_client 2>/dev/null)"; then
+    echo "  DHCP client:       ${DHCP_CLIENT}"
+  else
+    echo "  DHCP client:       none detected"
+  fi
+
+  if have_command systemctl; then
+    if systemctl is-enabled usb-ethernet-gadget.service >/dev/null 2>&1; then
+      status="$(systemctl is-active usb-ethernet-gadget.service 2>/dev/null || true)"
+      echo "  Manual service:    enabled (${status:-unknown})"
+    elif systemctl list-unit-files | grep -Fq "usb-ethernet-gadget.service"; then
+      status="$(systemctl is-active usb-ethernet-gadget.service 2>/dev/null || true)"
+      echo "  Manual service:    installed but disabled (${status:-unknown})"
+    else
+      echo "  Manual service:    not installed"
+    fi
+  else
+    echo "  Manual service:    unavailable (systemctl missing)"
+  fi
+
+  if have_command ip; then
+    if ip link show "$USB_IFACE" >/dev/null 2>&1; then
+      local addr
+      addr="$(ip -o -4 addr show dev "$USB_IFACE" | awk '{print $4}' | paste -sd ',' -)"
+      echo "  Interface state:   present (${USB_IFACE})"
+      echo "  IPv4 address:      ${addr:-none}"
+    else
+      echo "  Interface state:   ${USB_IFACE} not present"
+    fi
+  else
+    echo "  Interface state:   unavailable (ip command missing)"
+  fi
+
+  if have_command vcgencmd; then
+    status="$(vcgencmd get_throttled 2>/dev/null | awk -F= '{print $2}' || true)"
+    echo "  Power status:      ${status:-unknown}"
+  else
+    echo "  Power status:      vcgencmd unavailable"
+  fi
+
+  echo
+  echo "Assessment"
+
+  if [[ "$model" != *"Raspberry Pi"* ]]; then
+    echo "  - This host does not identify as a Raspberry Pi. Gadget mode is unlikely to work."
+  fi
+
+  if [[ "$model" == *"Raspberry Pi 5"* ]]; then
+    echo "  - Use the OTG-capable USB-C port for data. If power is unstable, power the board separately."
+  fi
+
+  if ! boot_overlay_enabled 2>/dev/null; then
+    echo "  - Enable dtoverlay=dwc2,dr_mode=peripheral for manual g_ether bring-up."
+  fi
+
+  if ! module_load_config_present "dwc2"; then
+    echo "  - Configure dwc2 to load at boot for the manual backend."
+  fi
+
+  if [[ "$BACKEND_REQUESTED" == "official" || "$BACKEND_REQUESTED" == "auto" ]]; then
+    if ! is_rpi_os_trixie; then
+      echo "  - Official backend is unavailable because Raspberry Pi OS Trixie is not detected."
+    elif ! have_command rpi-usb-gadget; then
+      echo "  - Official backend is unavailable because rpi-usb-gadget is not installed."
+    elif ! have_command nmcli; then
+      echo "  - Official backend is unavailable because NetworkManager/nmcli is missing."
+    fi
+  fi
+
+  if [[ "$USB_MODE" == "dhcp" ]] && [[ "$BACKEND_REQUESTED" != "official" ]] && ! select_dhcp_client >/dev/null 2>&1; then
+    echo "  - Manual DHCP mode is unavailable until dhclient, dhcpcd, or udhcpc is installed."
+  fi
+}
+
+write_default_config() {
+  cat > /etc/default/usb-ethernet-gadget <<DEFAULTS
+USB_IP="${USB_IP}"
+USB_NETMASK="${USB_NETMASK}"
+USB_IFACE="${USB_IFACE}"
+USB_MODE="${USB_MODE}"
+USB_BACKEND="${USB_BACKEND}"
+DEFAULTS
+}
+
 install_runtime_script() {
   cat > /usr/local/sbin/usb_ethernet_gadget_start.sh <<'RUNTIME'
 #!/usr/bin/env bash
 set -euo pipefail
+
+PID_BASE="/run/usb-ethernet-gadget"
 
 if [[ -f /etc/default/usb-ethernet-gadget ]]; then
   # shellcheck source=/etc/default/usb-ethernet-gadget
@@ -232,6 +560,8 @@ fi
 USB_IP="${USB_IP:-192.168.7.2}"
 USB_NETMASK="${USB_NETMASK:-255.255.255.0}"
 USB_IFACE="${USB_IFACE:-usb0}"
+USB_MODE="${USB_MODE:-static}"
+ACTION="${1:-start}"
 
 netmask_to_cidr() {
   local mask="$1"
@@ -247,12 +577,10 @@ netmask_to_cidr() {
   for o in "${octets[@]}"; do
     [[ "$o" =~ ^[0-9]+$ ]] || return 1
     (( o >= 0 && o <= 255 )) || return 1
-
     if (( tail_only == 1 )); then
       (( o == 0 )) || return 1
       continue
     fi
-
     case "$o" in
       255) (( cidr += 8 )) ;;
       254) bits=7; (( cidr += bits )); tail_only=1 ;;
@@ -270,51 +598,109 @@ netmask_to_cidr() {
   echo "$cidr"
 }
 
-modprobe libcomposite
-mkdir -p /sys/kernel/config
-mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+wait_for_interface() {
+  local iface="$1"
+  local attempt
+  for attempt in $(seq 1 40); do
+    if ip link show "$iface" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "Timed out waiting for interface ${iface}" >&2
+  return 1
+}
 
-G=/sys/kernel/config/usb_gadget/usbeth
-mkdir -p "$G"
+select_dhcp_client() {
+  if command -v dhclient >/dev/null 2>&1; then
+    echo "dhclient"
+    return 0
+  fi
+  if command -v dhcpcd >/dev/null 2>&1; then
+    echo "dhcpcd"
+    return 0
+  fi
+  if command -v udhcpc >/dev/null 2>&1; then
+    echo "udhcpc"
+    return 0
+  fi
+  return 1
+}
 
-echo 0x1d6b > "$G/idVendor"
-echo 0x0104 > "$G/idProduct"
-echo 0x0100 > "$G/bcdDevice"
-echo 0x0200 > "$G/bcdUSB"
+stop_dhcp_client() {
+  if [[ -f "${PID_BASE}.dhclient.pid" ]]; then
+    dhclient -r -pf "${PID_BASE}.dhclient.pid" "$USB_IFACE" >/dev/null 2>&1 || true
+    rm -f "${PID_BASE}.dhclient.pid"
+  fi
 
-mkdir -p "$G/strings/0x409"
-SERIAL="$(awk -F': ' '/^Serial/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
-if [[ -z "$SERIAL" ]]; then
-  SERIAL="0000000000000000"
-fi
-echo "$SERIAL" > "$G/strings/0x409/serialnumber"
-echo "Raspberry Pi" > "$G/strings/0x409/manufacturer"
-echo "USB Ethernet Gadget" > "$G/strings/0x409/product"
+  if command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -x "$USB_IFACE" >/dev/null 2>&1 || dhcpcd -k "$USB_IFACE" >/dev/null 2>&1 || true
+  fi
 
-mkdir -p "$G/configs/c.1/strings/0x409"
-echo "USB ECM config" > "$G/configs/c.1/strings/0x409/configuration"
-echo 120 > "$G/configs/c.1/MaxPower"
+  if [[ -f "${PID_BASE}.udhcpc.pid" ]]; then
+    kill "$(cat "${PID_BASE}.udhcpc.pid")" >/dev/null 2>&1 || true
+    rm -f "${PID_BASE}.udhcpc.pid"
+  fi
+}
 
-if [[ ! -d "$G/functions/ecm.usb0" ]]; then
-  mkdir -p "$G/functions/ecm.usb0"
-fi
-if [[ ! -L "$G/configs/c.1/ecm.usb0" ]]; then
-  ln -s "$G/functions/ecm.usb0" "$G/configs/c.1/ecm.usb0"
-fi
+acquire_dhcp() {
+  local client
+  client="$(select_dhcp_client)" || {
+    echo "No DHCP client found. Install dhclient, dhcpcd, or udhcpc." >&2
+    exit 1
+  }
 
-if [[ ! -s "$G/UDC" ]]; then
-  UDC_NAME="$(ls /sys/class/udc | head -n1)"
-  if [[ -z "$UDC_NAME" ]]; then
-    echo "No UDC controller found. Ensure OTG peripheral mode is enabled." >&2
+  case "$client" in
+    dhclient)
+      dhclient -r "$USB_IFACE" >/dev/null 2>&1 || true
+      dhclient -pf "${PID_BASE}.dhclient.pid" "$USB_IFACE"
+      ;;
+    dhcpcd)
+      dhcpcd -w "$USB_IFACE"
+      ;;
+    udhcpc)
+      udhcpc -S -i "$USB_IFACE" -p "${PID_BASE}.udhcpc.pid" >/dev/null 2>&1 &
+      sleep 2
+      ;;
+  esac
+}
+
+start_manual_backend() {
+  if ! modprobe g_ether; then
+    echo "Failed to load g_ether. Ensure dtoverlay=dwc2,dr_mode=peripheral is active and the OTG-capable USB port is used." >&2
     exit 1
   fi
-  echo "$UDC_NAME" > "$G/UDC"
-fi
 
-USB_CIDR="$(netmask_to_cidr "$USB_NETMASK")"
-ip link set "$USB_IFACE" up || true
-ip addr flush dev "$USB_IFACE" || true
-ip addr add "${USB_IP}/${USB_CIDR}" dev "$USB_IFACE"
+  wait_for_interface "$USB_IFACE"
+  ip link set "$USB_IFACE" up
+  ip addr flush dev "$USB_IFACE" || true
+
+  if [[ "$USB_MODE" == "static" ]]; then
+    local cidr
+    cidr="$(netmask_to_cidr "$USB_NETMASK")"
+    ip addr add "${USB_IP}/${cidr}" dev "$USB_IFACE"
+    return
+  fi
+
+  stop_dhcp_client
+  acquire_dhcp
+}
+
+stop_manual_backend() {
+  stop_dhcp_client
+  ip addr flush dev "$USB_IFACE" >/dev/null 2>&1 || true
+  ip link set "$USB_IFACE" down >/dev/null 2>&1 || true
+  modprobe -r g_ether >/dev/null 2>&1 || true
+}
+
+case "$ACTION" in
+  start) start_manual_backend ;;
+  stop) stop_manual_backend ;;
+  *)
+    echo "Unsupported action: ${ACTION}" >&2
+    exit 1
+    ;;
+esac
 RUNTIME
 
   chmod 0755 /usr/local/sbin/usb_ethernet_gadget_start.sh
@@ -323,13 +709,15 @@ RUNTIME
 install_systemd_service() {
   cat > /etc/systemd/system/usb-ethernet-gadget.service <<'SERVICE'
 [Unit]
-Description=USB Ethernet Gadget (ECM) for Raspberry Pi
-After=systemd-modules-load.service sys-kernel-config.mount
-Requires=sys-kernel-config.mount
+Description=USB Ethernet Gadget for Raspberry Pi
+After=systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/usb_ethernet_gadget_start.sh
+ExecStart=/usr/local/sbin/usb_ethernet_gadget_start.sh start
+ExecStop=/usr/local/sbin/usb_ethernet_gadget_start.sh stop
 RemainAfterExit=yes
 
 [Install]
@@ -340,15 +728,7 @@ SERVICE
   systemctl enable usb-ethernet-gadget.service
 }
 
-write_default_config() {
-  cat > /etc/default/usb-ethernet-gadget <<DEFAULTS
-USB_IP="${USB_IP}"
-USB_NETMASK="${USB_NETMASK}"
-USB_IFACE="${USB_IFACE}"
-DEFAULTS
-}
-
-configure_boot() {
+configure_boot_manual() {
   local boot_config
   boot_config="$(detect_boot_config)"
 
@@ -357,13 +737,43 @@ configure_boot() {
 
   append_if_missing "$boot_config" "dtoverlay=dwc2,dr_mode=peripheral"
   append_if_missing /etc/modules-load.d/usb-ethernet-gadget.conf "dwc2"
-  append_if_missing /etc/modules-load.d/usb-ethernet-gadget.conf "libcomposite"
 }
 
 backup_install_targets() {
+  local boot_config
+  boot_config="$(detect_boot_config)"
+
+  backup_file_if_needed "$boot_config"
   backup_file_if_needed /etc/default/usb-ethernet-gadget
   backup_file_if_needed /usr/local/sbin/usb_ethernet_gadget_start.sh
   backup_file_if_needed /etc/systemd/system/usb-ethernet-gadget.service
+  backup_file_if_needed /etc/modules-load.d/usb-ethernet-gadget.conf
+  backup_file_if_needed /etc/modules-load.d/usb-gadget.conf
+  backup_file_if_needed /etc/NetworkManager/dnsmasq-shared.d/90-rpi-usb-gadget-lease.conf
+}
+
+disable_other_backend() {
+  stop_disable_service_if_present
+  if have_command rpi-usb-gadget; then
+    rpi-usb-gadget off >/dev/null 2>&1 || true
+  fi
+}
+
+enable_official_backend() {
+  [[ "$USB_MODE" == "dhcp" ]] || fail "Official backend only supports DHCP mode."
+  [[ "$USB_IFACE" == "usb0" ]] || fail "Official backend currently expects usb0."
+  have_command nmcli || fail "Official backend requires nmcli."
+
+  note "Enabling official rpi-usb-gadget backend."
+  rpi-usb-gadget on
+}
+
+start_manual_service() {
+  note "Applying manual gadget service now..."
+  if ! systemctl start usb-ethernet-gadget.service; then
+    echo "Service start failed. Check: journalctl -u usb-ethernet-gadget.service" >&2
+    exit 1
+  fi
 }
 
 revert_changes() {
@@ -371,6 +781,9 @@ revert_changes() {
   [[ -f "$manifest_file" ]] || fail "Backup manifest not found: $manifest_file"
 
   stop_disable_service_if_present
+  if have_command rpi-usb-gadget; then
+    rpi-usb-gadget off >/dev/null 2>&1 || true
+  fi
 
   while IFS=' ' read -r state target; do
     [[ -n "$state" ]] || continue
@@ -383,30 +796,49 @@ revert_changes() {
 }
 
 setup_changes() {
+  resolve_backend
+  print_preflight_diagnostics
   backup_install_targets
-  configure_boot
+  disable_other_backend
   write_default_config
-  install_runtime_script
-  install_systemd_service
+
+  if [[ "$USB_BACKEND" == "official" ]]; then
+    enable_official_backend
+  else
+    configure_boot_manual
+    install_runtime_script
+    install_systemd_service
+    start_manual_service
+  fi
 
   echo "Configured USB Ethernet gadget."
-  echo "  IP:        ${USB_IP}"
-  echo "  Netmask:   ${USB_NETMASK} (/${USB_CIDR})"
+  echo "  Backend:   ${USB_BACKEND}"
+  echo "  Mode:      ${USB_MODE}"
   echo "  Interface: ${USB_IFACE}"
+  if [[ "$USB_MODE" == "static" ]]; then
+    echo "  IP:        ${USB_IP}"
+    echo "  Netmask:   ${USB_NETMASK} (/${USB_CIDR})"
+  fi
   echo "  Backup:    ${BACKUP_DIR}"
   echo
-  echo "Applying service now..."
-  if ! systemctl start usb-ethernet-gadget.service; then
-    echo "Service start failed. Check: journalctl -u usb-ethernet-gadget.service" >&2
-    exit 1
+  if [[ "$USB_BACKEND" == "official" ]]; then
+    echo "Official backend enabled. Reboot is recommended if the overlay/modules were not already active."
+  else
+    echo "Manual backend started successfully. Reboot is recommended to ensure boot overlay/module changes are active."
   fi
-  echo "Service started successfully."
-  echo "Reboot is recommended to ensure boot overlay/module changes are active."
 }
 
 main() {
   parse_args "$@"
+
+  if [[ "$ACTION" == "diagnose" ]]; then
+    require_diagnose_commands
+    diagnose_system
+    return
+  fi
+
   require_root
+  require_commands
   prepare_backup_env
 
   if [[ "$ACTION" == "revert" ]]; then
